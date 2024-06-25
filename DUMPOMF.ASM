@@ -39,13 +39,14 @@ lnamidx dd ?	;name index for LNAMES
 segidx  dd ?	;name index for SEGDEF
 grpidx  dd ?	;name index for GRPDEF
 extidx  dd ?	;name index for EXTDEF
-cursiz  dd ?
+cursiz  dd ?	;size of current record
 curpos  LPVOID ?
 
 ;--- rcmd and rlen must be consecutive
 rcmd	db ?	;record cmd byte
 rlen	dw ?	;record length
 lchksum	db ?	;checksum calculated
+bOptPos db ?
 
 	align
 
@@ -886,6 +887,58 @@ local lbyte:byte
 	ret
 fixupp_out endp
 
+;--- LIDATA
+;--- esi=record start
+;--- record structure:
+;--- seg#   index
+;--- offset dw/dd
+;--- data_block[]
+;
+;--- data block:
+;--- count    dw/dd
+;--- blockcnt dw
+;--- content, depends on blockcnt:
+;--- blockcnt == 0: followed by 1-byte count, followed by count bytes
+;--- blockcnt != 0: followed by <blockcnt> data blocks (recursive)
+
+lidata_out proc
+	masmnop
+	invoke putstrz, CStr(' Segment:')
+	call index_out
+	invoke putstrz, CStr(' Offs:')
+	call wdw_out
+	invoke putchr,10
+	call datablock_out
+	ret
+datablock_out:
+	invoke putstrz, CStr('    Count:')
+	call wdw_out
+	invoke putstrz, CStr(' Blk count:')
+	lodsw
+	push eax
+	call word_out
+	pop eax
+	.if ax == 0
+		invoke putstrz, CStr(" Bytes:")
+		lodsb
+		movzx eax, al
+		mov cursiz, eax
+		mov curpos, esi
+		call byte_out
+		invoke putchr,10
+		invoke puthexb, curpos, cursiz
+	.else
+@@:
+		push eax
+		invoke putchr,10
+		call datablock_out
+		pop eax
+		dec ax
+		jnz @B
+	.endif
+	retn
+lidata_out endp
+
 ;--- LEDATA record out
 ;--- esi=record start
 
@@ -1161,7 +1214,7 @@ pr5:
 	.elseif al==CMD_LEDATA
 		call ledata_out
 	.elseif al==CMD_LIDATA
-		call ledata_out
+		call lidata_out
 	.elseif al==CMD_COMDEF || al==CMD_LCOMDEF
 		call comdef_out
 	.elseif al==CMD_CEXTDEF
@@ -1214,7 +1267,22 @@ local fh:ptr	;file handle
 	cmp argc, 2
 	jb nofile
 	mov ebx, argv
-	mov esi, [ebx+4]
+	mov ecx, 1
+	.while ecx < argc
+		mov esi, [ebx+ecx*4]
+		mov ax, [esi]
+		.if al == '/' || al == '-'
+			or ah, 20h
+			.if ah == 'p'
+				mov bOptPos, 1
+			.else
+				jmp nofile
+			.endif
+		.else
+			.break
+		.endif
+		inc ecx
+	.endw
 	invoke fopen, esi, CStr("rb")
 	and eax, eax
 	jz filenotfound
@@ -1224,15 +1292,22 @@ local fh:ptr	;file handle
 		invoke fread, offset rcmd, 1, 3, fh	;read 3-byte record header
 		.break .if ( eax == 0 )
 		cmp eax,3
-		jnz readerror
-		add fpos, 3
+		jnz readerrorhdr
 		movzx eax,rlen		;record length
 		cmp eax, 1			;record size must be at least 1 ( the chksum )
-		jbe readerror
+		jbe readerrorsize
 		mov cursiz,eax
+		add fpos, 3
 		invoke fread, offset recbuf, 1, eax, fh
 		cmp eax,cursiz
-		jnz readerror
+		jnz readerroreof
+		.if bOptPos
+			push eax
+			mov eax, fpos
+			sub eax, 3
+			invoke printf, CStr("%5X "), eax
+			pop eax
+		.endif
 		add fpos, eax
 		call getchksum
 		mov lchksum, ah
@@ -1242,8 +1317,17 @@ local fh:ptr	;file handle
 	xor eax, eax
 	ret
 
-readerror:
-	invoke putstrz, CStr('unexpected end of file, last position=')
+readerrorsize:
+	invoke putstrz, CStr('record size 0 found')
+	jmp readerror1
+readerrorhdr:
+	invoke putstrz, CStr('unexpected end of file reading record hdr')
+	jmp readerror1
+readerroreof:
+	invoke putstrz, CStr('unexpected end of file')
+	jmp readerror1
+readerror1:
+	invoke putstrz, CStr(', last position=')
 	mov eax, fpos
 	call dword_out
 	invoke putchr, 10
@@ -1255,8 +1339,10 @@ filenotfound:
 	invoke putstrz, CStr("' not found",10)
 	jmp errexit
 nofile:
-	invoke putstrz, CStr('dumpomf v1.6, displays contents of OMF object files.',10)
-	invoke putstrz, CStr('usage: dumpomf filename',10)
+	invoke putstrz, CStr('dumpomf v1.7, displays contents of OMF object files.',10)
+	invoke putstrz, CStr('usage: dumpomf [options] filename',10)
+	invoke putstrz, CStr(' options:',10)
+	invoke putstrz, CStr('  -p: display file position',10)
 errexit:
 	mov eax, 1
 	ret
