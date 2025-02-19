@@ -13,9 +13,18 @@
 	option casemap:none
 	option proc:private
 
+MAXLNAME equ 1024
+MAXEXT   equ 1024
+LNAMEBUFFSIZE equ 65536
+EXTBUFFSIZE   equ 65536
+MAXSEG equ 256
+
+FIXUPTGTTRANS equ 1  ;1=translate extidx target data to extidx name
+
 LPVOID typedef ptr
 
 	include stdio.inc
+	include stdlib.inc
 	include omfspec.inc
 
 CStr macro text:vararg	;define a constant text
@@ -32,6 +41,17 @@ ifndef __JWASM__
 	nop
 endif
 endm
+
+	.data
+
+fixuprec dd 0
+fixupcnt dd 0
+threadcnt dd 0
+pLNameTab dd 0
+pLNameBuf dd 0
+pExtTab  dd 0
+pExtBuf  dd 0
+pSegTab  dd 0
 
 	.data?
 
@@ -325,7 +345,9 @@ index_out proc
 	lodsb
 @@:
 	movzx eax, ax
+	push eax
 	invoke printf, CStr("%u"), eax
+	pop eax
 	ret
 index_out endp
 
@@ -417,6 +439,13 @@ local method:byte
 	.if ( al < 3 )
 		invoke putstrz, CStr(' TgDat:')
 		call index_out
+if FIXUPTGTTRANS
+		mov cl,method
+		and cl,11b
+		.if cl == 10b	  ;if it's extidx
+			call idx2ext
+		.endif
+endif
 	.endif
 	mov al, method
 	and al, 0100b
@@ -625,6 +654,61 @@ modend_out proc
 	ret
 modend_out endp
 
+;--- if mode == 0, esi -> string
+;--- if mode != 0, its the lname idx to be stored
+
+store_ext proc mode:dword
+	cmp extidx, MAXEXT
+	jc @F
+	invoke putstrz, CStr('ext table too small',10)
+	stc
+	ret
+@@:
+	.if !pExtTab
+		invoke malloc, MAXEXT*4 + EXTBUFFSIZE
+		.if !eax
+			invoke putstrz, CStr('malloc for ext failed',10)
+			stc
+			ret
+		.endif
+		mov pExtTab, eax
+		add eax, MAXEXT*4
+		mov pExtBuf, eax
+	.endif
+	mov eax,extidx
+	shl eax,2
+	add eax,pExtTab
+    .if !mode
+		pushad
+		mov edi,pExtBuf
+		mov [eax],edi
+		lodsb
+		stosb
+		movzx ecx,al
+		rep movsb
+		mov pExtBuf,edi
+		mov eax,pExtTab
+		add eax,MAXEXT*4
+		sub edi,eax
+		cmp edi,EXTBUFFSIZE
+		popad
+		jc @F
+		invoke putstrz, CStr('ext buffer table too small',10)
+		stc
+		ret
+@@:
+	.else
+		mov edx, mode
+		shl edx, 2
+		add edx, pLNameTab
+		mov edx,[edx]
+		mov [eax],edx
+	.endif
+	clc
+exit:
+	ret    
+store_ext endp
+
 ;--- EXTDEF/LEXTDEF record out
 ;--- esi=record start
 
@@ -640,6 +724,7 @@ extdef_out proc
 		invoke putstrz, CStr("    ")
 		inc extidx
 		invoke printf, CStr("%5u='"), extidx
+		invoke store_ext,0
 		call name_out
 		invoke putstrz, CStr("' Type:")
 		call index_out
@@ -647,6 +732,17 @@ extdef_out proc
 	.endw
 	ret
 extdef_out endp
+
+;--- eax = index in ext table
+
+idx2ext proc uses eax esi
+	mov esi, pExtTab
+	mov esi,[eax*4+esi]
+	invoke putstrz, CStr(' [')
+	invoke name_out
+	invoke putstrz, CStr(']')
+	ret
+idx2ext endp
 
 ;--- PUBDEF/LPUBDEF record out
 ;--- esi=record start
@@ -701,6 +797,50 @@ linnum_out proc uses ebx
 	ret
 linnum_out endp
 
+store_lname proc
+	cmp lnamidx, MAXLNAME
+	jc @F
+	invoke putstrz, CStr('lname table too small',10)
+	stc
+	ret
+@@:
+	.if !pLNameTab
+		invoke malloc, MAXLNAME*4 + LNAMEBUFFSIZE
+		.if !eax
+			invoke putstrz, CStr('malloc for lnames failed',10)
+			stc
+			ret
+		.endif
+		mov pLNameTab, eax
+		add eax, MAXLNAME*4
+		mov pLNameBuf, eax
+	.endif
+	mov eax,lnamidx
+	shl eax,2
+	add eax,pLNameTab
+	pushad
+	mov edi,pLNameBuf
+	mov [eax],edi
+	lodsb
+	stosb
+	movzx ecx,al
+	rep movsb
+	mov pLNameBuf,edi
+	mov eax,pLNameTab
+	add eax,MAXLNAME*4
+	sub edi,eax
+	cmp edi,LNAMEBUFFSIZE
+	popad
+	jc @F
+	invoke putstrz, CStr('lname buffer table too small',10)
+	stc
+	ret
+@@:
+	clc
+exit:
+	ret    
+store_lname endp
+
 ;--- LNAMES/LLNAMES record out
 ;--- esi=record start
 
@@ -716,12 +856,62 @@ lnames_out proc
 		inc lnamidx
 		invoke putstrz, CStr("    ")
 		invoke printf, CStr("%5u='"), lnamidx
+		invoke store_lname
 		invoke name_out
 		invoke putchr, "'"
 		invoke putchr, 10
 	.endw
+exit:
 	ret
 lnames_out endp
+
+;--- eax = index in lname table
+
+idx2lname proc uses eax esi
+	mov esi, pLNameTab
+	mov esi,[eax*4+esi]
+	invoke putstrz, CStr(' [')
+	invoke name_out
+	invoke putstrz, CStr(']')
+	ret
+idx2lname endp
+
+segidx2lname proc uses esi
+	mov esi, pSegTab
+	mov eax, [eax*4+esi]
+	invoke idx2lname
+	ret
+segidx2lname endp
+
+storeseg proc
+	cmp segidx, MAXSEG
+	jc @F
+	invoke putstrz, CStr('segdef table too small',10)
+	stc
+	ret
+@@:
+	push eax
+	.if !pSegTab
+		invoke malloc, MAXSEG*4
+		.if !eax
+			invoke putstrz, CStr('malloc for segdef failed',10)
+			stc
+			ret
+		.endif
+		mov pSegTab, eax
+	.endif
+    pop eax
+	mov edx,segidx
+	shl edx,2
+	add edx,pSegTab
+	movzx eax,ax
+	mov [edx],eax
+	ret
+@@:
+	clc
+exit:
+	ret    
+storeseg endp
 
 ;--- SEGDEF record out
 ;--- esi=record start
@@ -773,14 +963,45 @@ local attr:byte
 
 	invoke putstrz, CStr(' Name:')
 	call index_out
+	invoke idx2lname
+	invoke storeseg
+
 	invoke putstrz, CStr(' Class:')
 	call index_out
+	invoke idx2lname
 	invoke putstrz, CStr(' Ovl:')
 	call index_out
 
 	invoke putchr,10
 	ret
 segdef_out endp
+
+;--- CEXTDEF record out
+;--- such a record defines an external index for a COMDAT symbol
+;--- it is needed when a FIXUPP record refers to a COMDAT symbol.
+;--- esi=record start
+
+cextdef_out proc
+	mov edi, cursiz
+	dec edi
+	add edi, esi
+	call length_out
+	invoke putchr, 10
+
+	.while esi < edi
+		invoke putstrz, CStr("    ")
+		inc extidx
+		invoke printf, CStr("%5u="), extidx
+		invoke putstrz, CStr(" Idx:")
+		call index_out
+		invoke idx2lname
+		invoke store_ext,eax		; a pointer to the lname buffer has to be stored in exttab
+		invoke putstrz, CStr(" Type:")
+		call index_out
+		invoke putchr,10
+	.endw
+	ret
+cextdef_out endp
 
 ;--- GRPDEF record out
 ;--- esi=record start
@@ -796,6 +1017,7 @@ grpdef_out proc
 
 	invoke putstrz, CStr(' Name:')
 	call index_out
+	invoke idx2lname
 
 	mov eax, esi
 	sub eax, curpos
@@ -811,6 +1033,7 @@ grpdef_out proc
 		call byte_out
 		invoke putstrz, CStr(' Seg:')
 		call index_out
+		call segidx2lname
 	.endw
 	invoke putchr,10
 	ret
@@ -858,6 +1081,8 @@ local lbyte:byte
 
 			call putfixup
 
+			inc fixupcnt
+
 		.else
 			invoke putstrz, CStr('    Thrd: ')
 			mov al,lbyte
@@ -881,8 +1106,12 @@ local lbyte:byte
 				invoke putstrz, CStr(' Idx:')
 				call index_out
 			.endif
+
+			inc threadcnt
+
 		.endif
 	.endw
+	inc fixuprec
 	invoke putchr,10
 	ret
 fixupp_out endp
@@ -905,6 +1134,7 @@ lidata_out proc
 	masmnop
 	invoke putstrz, CStr(' Segment:')
 	call index_out
+	call segidx2lname
 	invoke putstrz, CStr(' Offs:')
 	call wdw_out
 	invoke putchr,10
@@ -947,6 +1177,7 @@ ledata_out proc
 	masmnop
 	invoke putstrz, CStr(' Segment:')
 	call index_out
+	call segidx2lname
 	invoke putstrz, CStr(' Offs:')
 	call wdw_out
 
@@ -1014,6 +1245,7 @@ comdef_out proc
 		invoke putstrz, CStr("    ")
 		inc extidx
 		invoke printf, CStr("%5u='"), extidx
+		invoke store_ext,0
 		call name_out
 		invoke putstrz, CStr("' Type:")
 		call index_out
@@ -1038,31 +1270,6 @@ comdef_out proc
 	.endw
 	ret
 comdef_out endp
-
-;--- CEXTDEF record out
-;--- such a record defines an external index for a COMDAT symbol
-;--- it is needed when a FIXUPP record refers to a COMDAT symbol.
-;--- esi=record start
-
-cextdef_out proc
-	mov edi, cursiz
-	dec edi
-	add edi, esi
-	call length_out
-	invoke putchr, 10
-
-	.while esi < edi
-		invoke putstrz, CStr("    ")
-		inc extidx
-		invoke printf, CStr("%5u="), extidx
-		invoke putstrz, CStr(" Idx:")
-		call index_out
-		invoke putstrz, CStr(" Type:")
-		call index_out
-		invoke putchr,10
-	.endw
-	ret
-cextdef_out endp
 
 ;--- COMDAT record out
 ;--- esi=record start
@@ -1096,6 +1303,7 @@ local attr:byte
 
 	invoke putstrz, CStr(' PubName:')
 	call index_out
+	invoke idx2lname
 
 	mov eax, esi
 	sub eax, curpos
@@ -1120,6 +1328,7 @@ linsym_out proc uses ebx
 	call byte_out
 	invoke putstrz, CStr("    PubName:")
 	call index_out
+	invoke idx2lname
 	invoke putchr, 10
 	.while esi < edi
 		invoke putstrz, CStr("    ")
@@ -1314,6 +1523,10 @@ local fh:ptr	;file handle
 		call displayrec		;display record
 	.endw
 	invoke fclose, fh
+	.if fixuprec
+		invoke printf, CStr("Fixup records: %u, fixups: %u, threads: %u",10), fixuprec, fixupcnt, threadcnt
+	.endif
+    
 	xor eax, eax
 	ret
 
@@ -1339,7 +1552,7 @@ filenotfound:
 	invoke putstrz, CStr("' not found",10)
 	jmp errexit
 nofile:
-	invoke putstrz, CStr('dumpomf v1.7, displays contents of OMF object files.',10)
+	invoke putstrz, CStr('dumpomf v1.8, displays contents of OMF object files.',10)
 	invoke putstrz, CStr('usage: dumpomf [options] filename',10)
 	invoke putstrz, CStr(' options:',10)
 	invoke putstrz, CStr('  -p: display file position',10)
